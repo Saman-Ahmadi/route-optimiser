@@ -9,6 +9,7 @@ from shapely import wkt
 from shapely.geometry import LineString, MultiLineString, Point
 import pickle
 from datetime import datetime, timedelta
+import tempfile
 
 st.set_page_config(page_title="EV Cluster Viewer + Route", layout="wide")
 st.title("🚚 EV Cluster Viewer — Show One Cluster (Points + Stored Route)")
@@ -125,7 +126,7 @@ def calculate_time_schedule(total_distance_km, num_stops, start_time_str="07:00"
     Assumes:
     - Average speed: 40 km/h (urban driving)
     - Stop time: 15 minutes per delivery
-    - Start time: 6:00 AM
+    - Start time: 7:00 AM
     """
     start_time = datetime.strptime(start_time_str, "%H:%M")
     average_speed_kmh = 40
@@ -182,21 +183,65 @@ def calculate_energy_consumption_dynamic(route_segments, num_stops, initial_effi
     return total_energy
 
 # -------------------------
-# Load dataset
+# File Upload Section
 # -------------------------
-if not os.path.exists(ROUTES_PKL):
-    st.error(f"{ROUTES_PKL} not found. Please run the generator first.")
-    st.stop()
+st.sidebar.header("Route Data Source")
 
-try:
-    with open(ROUTES_PKL, 'rb') as f:
-        routes = pickle.load(f)
-except Exception as e:
-    st.error(f"Error loading {ROUTES_PKL}: {e}")
+# Option to use existing file or upload new
+data_source = st.sidebar.radio("Choose data source:", 
+                               ["Use existing routes_dataset.pkl", "Upload new route file"])
+
+routes = None
+
+if data_source == "Upload new route file":
+    uploaded_file = st.sidebar.file_uploader(
+        "Drag and drop your route file here", 
+        type=['pkl', 'pickle'],
+        help="Upload a .pkl file containing route data"
+    )
+    
+    if uploaded_file is not None:
+        try:
+            # Save uploaded file to temporary location
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_path = tmp_file.name
+            
+            # Load the routes from uploaded file
+            with open(tmp_path, 'rb') as f:
+                routes = pickle.load(f)
+            
+            # Clean up temporary file
+            os.unlink(tmp_path)
+            
+            st.sidebar.success(f"✅ Successfully loaded {len(routes)} routes from uploaded file!")
+            
+        except Exception as e:
+            st.sidebar.error(f"❌ Error loading uploaded file: {e}")
+            routes = None
+
+else:
+    # Use existing file
+    if not os.path.exists(ROUTES_PKL):
+        st.sidebar.warning(f"⚠️ {ROUTES_PKL} not found. Please upload a file or generate routes first.")
+    else:
+        try:
+            with open(ROUTES_PKL, 'rb') as f:
+                routes = pickle.load(f)
+            st.sidebar.success(f"✅ Loaded {len(routes)} routes from {ROUTES_PKL}")
+        except Exception as e:
+            st.sidebar.error(f"❌ Error loading {ROUTES_PKL}: {e}")
+            routes = None
+
+# -------------------------
+# Check if routes are loaded
+# -------------------------
+if routes is None:
+    st.error("No route data available. Please upload a route file or ensure routes_dataset.pkl exists.")
     st.stop()
 
 if not routes:
-    st.error("No routes found in pickle.")
+    st.error("No routes found in the loaded data.")
     st.stop()
 
 # -------------------------
@@ -233,7 +278,7 @@ st.sidebar.metric("Basic Energy Consumption (Unloaded)", f"{basic_energy:.1f} kW
                  f"at {basic_efficiency} kWh/100km")
 
 # Dynamic consumption (SOC calculation)
-if st.sidebar.button("🔋 Intially fully loaded?", help="Calculate dynamic energy consumption with unloading"):
+if st.sidebar.button("🔋 Initially fully loaded?", help="Calculate dynamic energy consumption with unloading"):
     # Estimate segment distances (in real implementation, you'd have actual segment distances)
     num_segments = len(points) + 1  # to/from depot
     segment_distance = distance_km / num_segments
@@ -265,7 +310,7 @@ if route_nodes:
 # -------------------------
 # Main display
 # -------------------------
-st.markdown(f"### Cluster {selected_cluster} — {len(points)} delivery points")
+st.markdown(f"### Van {selected_cluster} — {len(points)} delivery points")
 st.caption(f"Route distance: {distance_km:.2f} km | Total route nodes: {len(route_nodes)}")
 
 # Calculate time schedule
@@ -279,7 +324,6 @@ if points:
     schedule_data = []
     for i, point in enumerate(points):
         schedule_data.append({
-            # 'Stop': i + 1,
             'Name': point.get('name', 'Supermarket'),
             'Latitude': f"{point.get('lat', 0):.6f}",
             'Longitude': f"{point.get('lon', 0):.6f}",
@@ -359,7 +403,7 @@ else:
 if points:
     folium.Marker(
         [lat_avg, lon_avg],
-        tooltip=f"Cluster {selected_cluster} centroid",
+        tooltip=f"Van {selected_cluster} centroid",
         popup=f"Centroid of {len(points)} points",
         icon=folium.Icon(color="orange", icon="star", prefix="fa")
     ).add_to(m)
