@@ -11,8 +11,8 @@ import pickle
 from datetime import datetime, timedelta
 import tempfile
 
-st.set_page_config(page_title="EV Cluster Viewer + Route", layout="wide")
-st.title("🚚 EV Cluster Viewer — Show One Cluster (Points + Stored Route)")
+st.set_page_config(page_title="EV Route Viewer ", layout="wide")
+st.title("🚚 EV Van Route Viewer — Show One Van (Points + Stored Route)")
 
 ROUTES_PKL = "routes_dataset.pkl"
 
