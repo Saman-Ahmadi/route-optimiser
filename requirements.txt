@@ -4,5 +4,3 @@ streamlit-folium
 pandas
 numpy
 shapely
-pickle
-datetime
