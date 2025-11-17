@@ -1,0 +1,351 @@
+import pandas as pd
+import numpy as np
+import random
+import osmnx as ox
+import networkx as nx
+from sklearn.cluster import KMeans
+from shapely.geometry import LineString
+from tqdm import tqdm
+import os
+import pickle
+
+# General OSMnx settings
+ox.settings.use_cache = True
+ox.settings.log_console = False
+
+# ---------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------
+def nearest_node(G, lat, lon):
+    """Find the nearest graph node to a given lat/lon."""
+    return ox.distance.nearest_nodes(G, lon, lat)
+
+def route_length_and_geometry(G, path):
+    """Compute route length and shapely geometry."""
+    if len(path) < 2:
+        return 0.0, None
+    
+    length = 0.0
+    coords = []
+    
+    # Add starting point
+    start_node = path[0]
+    coords.append((G.nodes[start_node]['x'], G.nodes[start_node]['y']))
+    
+    for u, v in zip(path[:-1], path[1:]):
+        try:
+            # Get the shortest path between consecutive nodes in the TSP route
+            segment_path = nx.shortest_path(G, u, v, weight='length')
+            
+            for seg_u, seg_v in zip(segment_path[:-1], segment_path[1:]):
+                edge_data = G.get_edge_data(seg_u, seg_v, 0)
+                if edge_data and 'length' in edge_data:
+                    length += edge_data['length']
+                
+                # Add geometry for this segment
+                if edge_data and 'geometry' in edge_data:
+                    geom_coords = list(edge_data['geometry'].coords)
+                    coords.extend(geom_coords)
+                else:
+                    # If no geometry, use node coordinates
+                    coords.append((G.nodes[seg_v]['x'], G.nodes[seg_v]['y']))
+        except nx.NetworkXNoPath:
+            print(f"⚠️ No path between {u} and {v}, using straight line")
+            # Fallback: add straight line between nodes
+            u_lon, u_lat = G.nodes[u]['x'], G.nodes[u]['y']
+            v_lon, v_lat = G.nodes[v]['x'], G.nodes[v]['y']
+            coords.extend([(u_lon, u_lat), (v_lon, v_lat)])
+            # Estimate length using haversine
+            length += ox.distance.great_circle_vec(u_lat, u_lon, v_lat, v_lon)
+    
+    # Create LineString, removing consecutive duplicates
+    if len(coords) > 1:
+        unique_coords = [coords[0]]
+        for coord in coords[1:]:
+            if coord != unique_coords[-1]:
+                unique_coords.append(coord)
+        line = LineString(unique_coords)
+    else:
+        line = None
+        
+    return length, line
+
+def spatial_greedy_tsp_path(G, depot_node, nodes):
+    """Ultra-fast greedy TSP using spatial proximity only."""
+    # Remove duplicates and ensure all nodes are in graph
+    unique_nodes = list(set(nodes))
+    reachable_nodes = [n for n in unique_nodes if n in G and n != depot_node]
+    
+    if not reachable_nodes:
+        return [depot_node, depot_node]
+    
+    # Get coordinates for all nodes
+    def get_node_coord(node):
+        return np.array([G.nodes[node]['x'], G.nodes[node]['y']])
+    
+    depot_coord = get_node_coord(depot_node)
+    node_coords = [get_node_coord(node) for node in reachable_nodes]
+    
+    # Convert to numpy array for fast computation
+    coords_array = np.array(node_coords)
+    
+    route = [depot_node]
+    current_coord = depot_coord
+    remaining_indices = list(range(len(reachable_nodes)))
+    
+    while remaining_indices:
+        # Fast Euclidean distance calculation
+        distances = np.linalg.norm(coords_array[remaining_indices] - current_coord, axis=1)
+        
+        # Find nearest node
+        nearest_idx = np.argmin(distances)
+        actual_idx = remaining_indices[nearest_idx]
+        
+        nearest_node = reachable_nodes[actual_idx]
+        route.append(nearest_node)
+        current_coord = coords_array[actual_idx]
+        
+        # Remove visited node
+        remaining_indices.pop(nearest_idx)
+    
+    route.append(depot_node)
+    return route
+
+# ---------------------------------------------------------------------
+# Caching utilities
+# ---------------------------------------------------------------------
+def load_or_create_graph(depot_lat, depot_lon, dist=30000, graph_path="melbourne_graph.graphml", pickle_path="melbourne_graph.pkl"):
+    """
+    Load cached OSM graph from current working directory if exists.
+    Otherwise, download, save as both .graphml and .pkl.
+    """
+    cwd = os.getcwd()
+    graphml_file = os.path.join(cwd, graph_path)
+    pickle_file = os.path.join(cwd, pickle_path)
+
+    if os.path.exists(pickle_file):
+        print(f"Loading cached graph from {pickle_file}...")
+        with open(pickle_file, "rb") as f:
+            G = pickle.load(f)
+    elif os.path.exists(graphml_file):
+        print(f"Loading cached graph from {graphml_file}...")
+        G = ox.load_graphml(graphml_file)
+        with open(pickle_file, "wb") as f:
+            pickle.dump(G, f)
+    else:
+        print("Downloading Melbourne road network from OpenStreetMap...")
+        G = ox.graph_from_point((depot_lat, depot_lon), dist=dist, network_type="drive")
+        # Save both formats
+        ox.save_graphml(G, graphml_file)
+        with open(pickle_file, "wb") as f:
+            pickle.dump(G, f)
+        print(f"Graph saved to {graphml_file} and {pickle_file}")
+    return G
+
+def load_or_create_pois(depot_lat, depot_lon, pois_cache="pois.pkl", dist=30000):
+    """
+    Load cached POIs from current working directory or download and store locally.
+    """
+    cwd = os.getcwd()
+    pois_path = os.path.join(cwd, pois_cache)
+
+    if os.path.exists(pois_path):
+        print("Loading cached POIs...")
+        pois = pd.read_pickle(pois_path)
+    else:
+        print("Downloading POIs (supermarkets, groceries, marketplaces)...")
+        tags = {"shop": ["supermarket", "convenience", "grocery"], "amenity": ["marketplace"]}
+        pois = ox.geometries_from_point((depot_lat, depot_lon), tags=tags, dist=dist)
+        pois.to_pickle(pois_path)
+        print(f"POIs saved to {pois_path}")
+    return pois
+
+# ---------------------------------------------------------------------
+# Main Dataset Generator
+# ---------------------------------------------------------------------
+def generate_dataset(random_seed=42, total_routes=5, deliveries_per_route_avg=30):
+    depot_lat, depot_lon = -37.8065669, 144.9109551
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+
+    # Load cached network & POIs
+    G = load_or_create_graph(depot_lat, depot_lon)
+    pois = load_or_create_pois(depot_lat, depot_lon)
+
+    # Extract store coordinates
+    stores = []
+    for idx, row in pois.iterrows():
+        geom = row.geometry
+        if geom is None:
+            continue
+        if geom.geom_type == 'Point':
+            lat, lon = geom.y, geom.x
+        else:
+            c = geom.centroid
+            lat, lon = c.y, c.x
+        stores.append({'name': row.get('name', f'store_{idx}'), 'lat': lat, 'lon': lon})
+
+    stores_df = pd.DataFrame(stores)
+
+    # Calculate total stores needed
+    total_stores_needed = total_routes * deliveries_per_route_avg
+    
+    # If not enough POIs, synthesize some
+    needed = max(0, total_stores_needed - len(stores_df))
+    if needed > 0:
+        print(f"Adding {needed} synthetic stores...")
+        for i in range(needed):
+            stores_df.loc[len(stores_df)] = {
+                'name': f'syn_store_{i}',
+                'lat': depot_lat + random.uniform(-0.03, 0.03),
+                'lon': depot_lon + random.uniform(-0.03, 0.03)
+            }
+
+    # Cluster into zones with balanced sizes
+    if len(stores_df) < total_routes:
+        print(f"Reducing routes from {total_routes} to {len(stores_df)}")
+        total_routes = len(stores_df)
+    
+    if total_routes > 0:
+        # Use KMeans to create initial clusters
+        kmeans = KMeans(n_clusters=total_routes, random_state=random_seed, n_init=10).fit(stores_df[['lat', 'lon']])
+        stores_df['cluster_id'] = kmeans.labels_
+        
+        # Balance cluster sizes to have approximately deliveries_per_route_avg stores each
+        print(f"Balancing clusters to have ~{deliveries_per_route_avg} stores each...")
+        
+        # Calculate current cluster sizes
+        cluster_sizes = stores_df['cluster_id'].value_counts().to_dict()
+        
+        # Identify clusters that need adjustment
+        oversized_clusters = [cid for cid, size in cluster_sizes.items() if size > deliveries_per_route_avg]
+        undersized_clusters = [cid for cid, size in cluster_sizes.items() if size < deliveries_per_route_avg]
+        
+        # Reassign stores from oversized to undersized clusters
+        for oversized_cid in oversized_clusters:
+            oversize_cluster = stores_df[stores_df['cluster_id'] == oversized_cid]
+            oversize_count = len(oversize_cluster)
+            
+            # Calculate how many stores to move out
+            stores_to_move = oversize_count - deliveries_per_route_avg
+            
+            if stores_to_move > 0 and undersized_clusters:
+                # Get stores farthest from cluster center
+                cluster_center = kmeans.cluster_centers_[oversized_cid]
+                oversize_cluster['distance_to_center'] = np.sqrt(
+                    (oversize_cluster['lat'] - cluster_center[0])**2 + 
+                    (oversize_cluster['lon'] - cluster_center[1])**2
+                )
+                
+                # Sort by distance (farthest first)
+                stores_to_reassign = oversize_cluster.nlargest(stores_to_move, 'distance_to_center')
+                
+                # Reassign to nearest undersized cluster
+                for idx, store in stores_to_reassign.iterrows():
+                    if not undersized_clusters:
+                        break
+                        
+                    # Find nearest undersized cluster center
+                    store_coords = [[store['lat'], store['lon']]]
+                    distances = []
+                    for undersized_cid in undersized_clusters:
+                        center = kmeans.cluster_centers_[undersized_cid]
+                        distance = np.sqrt((store['lat'] - center[0])**2 + (store['lon'] - center[1])**2)
+                        distances.append((undersized_cid, distance))
+                    
+                    # Assign to nearest undersized cluster
+                    nearest_undersized = min(distances, key=lambda x: x[1])[0]
+                    stores_df.at[idx, 'cluster_id'] = nearest_undersized
+                    
+                    # Update cluster sizes
+                    cluster_sizes[oversized_cid] -= 1
+                    cluster_sizes[nearest_undersized] += 1
+                    
+                    # Remove undersized cluster if it reaches target size
+                    if cluster_sizes[nearest_undersized] >= deliveries_per_route_avg:
+                        undersized_clusters.remove(nearest_undersized)
+        
+        # Final cluster sizes
+        final_cluster_sizes = stores_df['cluster_id'].value_counts().sort_index()
+        print(f"Final cluster sizes: {dict(final_cluster_sizes)}")
+        
+    else:
+        print("No stores available")
+        return []
+
+    depot_node = nearest_node(G, depot_lat, depot_lon)
+    all_routes = []
+
+    print("Computing route geometries...")
+    for cid in tqdm(range(total_routes), desc="Processing clusters"):
+        cluster = stores_df[stores_df['cluster_id'] == cid]
+        if cluster.empty:
+            continue
+
+        # Limit cluster size to deliveries_per_route_avg if needed
+        if len(cluster) > deliveries_per_route_avg:
+            print(f"Cluster {cid} has {len(cluster)} stores, limiting to {deliveries_per_route_avg}")
+            # Take the stores closest to cluster center
+            cluster_center = kmeans.cluster_centers_[cid]
+            cluster['distance_to_center'] = np.sqrt(
+                (cluster['lat'] - cluster_center[0])**2 + 
+                (cluster['lon'] - cluster_center[1])**2
+            )
+            cluster = cluster.nsmallest(deliveries_per_route_avg, 'distance_to_center')
+
+        # Find nearest graph nodes
+        nodes = []
+        for _, store in cluster.iterrows():
+            try:
+                node = nearest_node(G, store['lat'], store['lon'])
+                nodes.append(node)
+            except Exception as e:
+                print(f"⚠️ Could not find node for store: {e}")
+                continue
+
+        if not nodes:
+            continue
+
+        # Use FAST spatial greedy TSP
+        tsp_route = spatial_greedy_tsp_path(G, depot_node, nodes)
+        
+        # Calculate actual route using network paths
+        total_length, route_geometry = route_length_and_geometry(G, tsp_route)
+        
+        route_info = {
+            'cluster_id': cid,
+            'route_nodes': tsp_route,
+            'stores': cluster.to_dict('records'),
+            'distance_km': total_length / 1000.0,
+            'geometry': route_geometry
+        }
+        
+        all_routes.append(route_info)
+
+    output_path = os.path.join(os.getcwd(), "routes_dataset.pkl")
+    with open(output_path, 'wb') as f:
+        pickle.dump(all_routes, f)
+    
+    # Print summary statistics
+    route_lengths = [r['distance_km'] for r in all_routes]
+    route_stores = [len(r['stores']) for r in all_routes]
+    
+    print(f"✅ Dataset saved with {len(all_routes)} routes.")
+    print(f"📊 Summary: {sum(route_stores)} total stores")
+    print(f"📊 Average stores per route: {np.mean(route_stores):.1f}")
+    print(f"📊 Average route length: {np.mean(route_lengths):.1f} km")
+    print(f"📊 Min/Max stores per route: {min(route_stores)}/{max(route_stores)}")
+    
+    return all_routes
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    routes = generate_dataset(total_routes=5, deliveries_per_route_avg=30)
+    
+    # Print the first route as example
+    if routes:
+        print("\nFirst route example:")
+        first_route = routes[0]
+        print(f"Cluster ID: {first_route['cluster_id']}")
+        print(f"Distance: {first_route['distance_km']:.2f} km")
+        print(f"Number of stores: {len(first_route['stores'])}")
+        print(f"Route nodes: {len(first_route['route_nodes'])} nodes")
