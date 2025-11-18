@@ -278,7 +278,7 @@ st.sidebar.metric("Basic Energy Consumption (Unloaded)", f"{basic_energy:.1f} kW
                  f"at {basic_efficiency} kWh/100km")
 
 # Dynamic consumption (SOC calculation)
-if st.sidebar.button("🔋 Initially fully loaded?", help="Calculate dynamic energy consumption with unloading"):
+if st.sidebar.button("🔋 Load+Road aware Calculation", help="Calculate dynamic energy consumption with unloading"):
     # Estimate segment distances (in real implementation, you'd have actual segment distances)
     num_segments = len(points) + 1  # to/from depot
     segment_distance = distance_km / num_segments
